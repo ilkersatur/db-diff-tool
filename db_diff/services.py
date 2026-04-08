@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -9,14 +8,6 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
 SYSTEM_SCHEMAS = {"INFORMATION_SCHEMA", "sys"}
-
-
-@dataclass(frozen=True)
-class TableColumnDiff:
-    column: str
-    dev_type: str
-    test_type: str
-    status: str
 
 
 def normalize_connection_string(conn_str: str) -> str:
@@ -67,9 +58,16 @@ def make_engine(conn_str: str) -> Engine:
 
 
 def read_schema(engine: Engine) -> tuple[list[str], dict[str, dict[str, str]]]:
+    bundle = read_schema_bundle(engine)
+    return bundle["tables"], bundle["schema_map"]
+
+
+def read_schema_bundle(engine: Engine) -> dict[str, Any]:
     inspector = inspect(engine)
     tables: list[str] = []
     schema_map: dict[str, dict[str, str]] = {}
+    table_defs: dict[str, dict[str, Any]] = {}
+    sequence_map: dict[str, dict[str, Any]] = {}
 
     for schema_name in inspector.get_schema_names():
         if schema_name in SYSTEM_SCHEMAS:
@@ -81,8 +79,80 @@ def read_schema(engine: Engine) -> tuple[list[str], dict[str, dict[str, str]]]:
             schema_map[full_name] = {
                 col["name"]: str(col.get("type", "UNKNOWN")).upper() for col in cols
             }
+            pk = inspector.get_pk_constraint(table, schema=schema_name) or {}
+            indexes = inspector.get_indexes(table, schema=schema_name) or []
+            table_defs[full_name] = {
+                "schema": schema_name,
+                "table": table,
+                "columns": [
+                    {
+                        "name": col["name"],
+                        "type": str(col.get("type", "UNKNOWN")).upper(),
+                        "nullable": bool(col.get("nullable", True)),
+                    }
+                    for col in cols
+                ],
+                "pk_name": pk.get("name"),
+                "pk_columns": pk.get("constrained_columns") or [],
+                "indexes": indexes,
+            }
 
-    return sorted(tables), schema_map
+    # SQL Server sequence metadata (if accessible on this engine/user).
+    try:
+        seq_query = text(
+            """
+            SELECT
+                s.name AS schema_name,
+                seq.name AS sequence_name,
+                UPPER(t.name) AS data_type,
+                seq.start_value,
+                seq.[increment] AS increment_value,
+                seq.minimum_value,
+                seq.maximum_value,
+                seq.is_cycling
+            FROM sys.sequences seq
+            INNER JOIN sys.schemas s ON s.schema_id = seq.schema_id
+            INNER JOIN sys.types t ON t.user_type_id = seq.user_type_id
+            """
+        )
+        with engine.connect() as conn:
+            for row in conn.execute(seq_query).mappings():
+                schema_name = row["schema_name"]
+                if schema_name in SYSTEM_SCHEMAS:
+                    continue
+                full_name = f"{schema_name}.{row['sequence_name']}"
+                sequence_map[full_name] = dict(row)
+    except Exception:
+        sequence_map = {}
+
+    # Fallback: if metadata query fails or returns empty, at least collect sequence names.
+    if not sequence_map:
+        try:
+            for schema_name in inspector.get_schema_names():
+                if schema_name in SYSTEM_SCHEMAS:
+                    continue
+                seq_names = inspector.get_sequence_names(schema=schema_name) or []
+                for seq_name in seq_names:
+                    full_name = f"{schema_name}.{seq_name}"
+                    sequence_map[full_name] = {
+                        "schema_name": schema_name,
+                        "sequence_name": seq_name,
+                        "data_type": "BIGINT",
+                        "start_value": 1,
+                        "increment_value": 1,
+                        "minimum_value": 1,
+                        "maximum_value": 9223372036854775807,
+                        "is_cycling": False,
+                    }
+        except Exception:
+            sequence_map = {}
+
+    return {
+        "tables": sorted(tables),
+        "schema_map": schema_map,
+        "table_defs": table_defs,
+        "sequences": sequence_map,
+    }
 
 
 def compare_table_columns(dev_cols: dict[str, str], test_cols: dict[str, str]) -> pd.DataFrame:

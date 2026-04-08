@@ -7,24 +7,108 @@ import pandas as pd
 from db_diff.services import quote_ident, qualified_table_name
 
 
+def _normalize_type_sql(dtype: str) -> str:
+    # SQLAlchemy may return collation names wrapped in double quotes on MSSQL.
+    return (dtype or "").replace('"', "")
+
+
 def generate_schema_sync_sql(
-    table_name: str, dev_cols: dict[str, str], test_cols: dict[str, str]
+    table_name: str,
+    dev_cols: dict[str, str],
+    test_cols: dict[str, str],
+    dev_table_def: dict[str, Any] | None = None,
 ) -> list[str]:
     sql: list[str] = []
     qualified = qualified_table_name(table_name)
 
     if not test_cols and dev_cols:
-        col_defs = ",\n    ".join(
-            f"{quote_ident(col)} {dtype}" for col, dtype in sorted(dev_cols.items())
-        )
-        sql.append(f"CREATE TABLE {qualified} (\n    {col_defs}\n);")
+        if dev_table_def:
+            sql.extend(generate_create_table_sql(dev_table_def))
+        else:
+            col_defs = ",\n    ".join(
+                f"{quote_ident(col)} {dtype}" for col, dtype in sorted(dev_cols.items())
+            )
+            sql.append(f"CREATE TABLE {qualified} (\n    {col_defs}\n);")
         return sql
 
     for col, dtype in sorted(dev_cols.items()):
         if col not in test_cols:
-            sql.append(f"ALTER TABLE {qualified} ADD {quote_ident(col)} {dtype};")
+            sql.append(f"ALTER TABLE {qualified} ADD {quote_ident(col)} {_normalize_type_sql(dtype)};")
         elif test_cols[col] != dtype:
-            sql.append(f"ALTER TABLE {qualified} ALTER COLUMN {quote_ident(col)} {dtype};")
+            sql.append(
+                f"ALTER TABLE {qualified} ALTER COLUMN {quote_ident(col)} {_normalize_type_sql(dtype)};"
+            )
+
+    # DEV is treated as source of truth: columns that exist only in TEST are removed.
+    for col in sorted(test_cols.keys()):
+        if col not in dev_cols:
+            sql.append(f"ALTER TABLE {qualified} DROP COLUMN {quote_ident(col)};")
+    return sql
+
+
+def generate_create_table_sql(table_def: dict[str, Any]) -> list[str]:
+    schema_name = table_def["schema"]
+    table_name = table_def["table"]
+    qualified = f"{quote_ident(schema_name)}.{quote_ident(table_name)}"
+    lines: list[str] = []
+    lines.append(f"-- {schema_name}.{table_name} definition")
+    lines.append("")
+    lines.append("-- Drop table")
+    lines.append(f"-- DROP TABLE {qualified};")
+    lines.append("")
+
+    col_parts = []
+    for col in table_def["columns"]:
+        nullable = "NULL" if col["nullable"] else "NOT NULL"
+        col_parts.append(
+            f"\t{quote_ident(col['name'])} {_normalize_type_sql(col['type'])} {nullable}"
+        )
+
+    pk_cols = table_def.get("pk_columns") or []
+    if pk_cols:
+        pk_name = table_def.get("pk_name") or f"PK_{table_name}"
+        joined_pk_cols = ", ".join(quote_ident(c) for c in pk_cols)
+        col_parts.append(f"\tCONSTRAINT {quote_ident(pk_name)} PRIMARY KEY ({joined_pk_cols})")
+
+    lines.append(f"CREATE TABLE {qualified} (")
+    lines.append(",\n".join(col_parts))
+    lines.append(");")
+
+    for idx in table_def.get("indexes", []):
+        idx_name = idx.get("name")
+        idx_cols = idx.get("column_names") or []
+        if not idx_name or not idx_cols:
+            continue
+        idx_kind = "UNIQUE NONCLUSTERED INDEX" if idx.get("unique") else "NONCLUSTERED INDEX"
+        joined_cols = ", ".join(quote_ident(c) for c in idx_cols)
+        lines.append(f"CREATE {idx_kind} {quote_ident(idx_name)} ON {qualified} ({joined_cols});")
+
+    return lines
+
+
+def generate_sequence_sync_sql(
+    dev_sequences: dict[str, dict[str, Any]], test_sequences: dict[str, dict[str, Any]]
+) -> list[str]:
+    sql: list[str] = []
+    dev_keys = set(dev_sequences.keys())
+    test_keys = set(test_sequences.keys())
+
+    for seq_name in sorted(dev_keys - test_keys):
+        seq = dev_sequences[seq_name]
+        qualified = f"{seq['schema_name']}.{seq['sequence_name']}"
+        cycle_sql = "CYCLE" if seq.get("is_cycling") else "NO CYCLE"
+        sql.append(f"CREATE SEQUENCE {qualified}")
+        sql.append(f"   START WITH {seq.get('start_value', 1)}")
+        sql.append(f"   INCREMENT BY {seq.get('increment_value', 1)}")
+        sql.append(f"   {cycle_sql};")
+        sql.append("")
+
+    # DEV source of truth: extra sequences in TEST are dropped.
+    for seq_name in sorted(test_keys - dev_keys):
+        schema_name, simple_name = seq_name.split(".", 1)
+        qualified = f"{quote_ident(schema_name)}.{quote_ident(simple_name)}"
+        sql.append(f"DROP SEQUENCE {qualified};")
+
     return sql
 
 

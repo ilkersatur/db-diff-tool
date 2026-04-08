@@ -7,7 +7,7 @@ STATUS_COLORS = {
     "matching": "#16a34a",
     "different": "#dc2626",
     "missing_in_test": "#f59e0b",
-    "missing_in_dev": "#f59e0b",
+    "missing_in_dev": "#a855f7",
 }
 
 STATUS_LABELS = {

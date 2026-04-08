@@ -13,6 +13,10 @@ DEFAULT_STATE = {
     "data_compare_enabled": False,
     "data_diff_result": None,
     "generated_sql": "",
+    "dev_table_defs": {},
+    "test_table_defs": {},
+    "dev_sequences": {},
+    "test_sequences": {},
 }
 
 
