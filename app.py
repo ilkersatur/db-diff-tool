@@ -3,6 +3,7 @@ import streamlit as st
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from urllib.parse import quote_plus
+from collections import Counter
 
 
 st.set_page_config(page_title="DB Diff Tool", layout="wide")
@@ -172,6 +173,40 @@ def compare_dataframes(dev_df: pd.DataFrame, test_df: pd.DataFrame, key_cols: li
     }
 
 
+def compare_dataframes_keyless(dev_df: pd.DataFrame, test_df: pd.DataFrame):
+    common_cols = [c for c in dev_df.columns if c in test_df.columns]
+    if not common_cols:
+        return {
+            "common_cols": [],
+            "only_dev": pd.DataFrame(),
+            "only_test": pd.DataFrame(),
+        }
+
+    dev_norm = dev_df[common_cols].copy().fillna("<NULL>").astype(str)
+    test_norm = test_df[common_cols].copy().fillna("<NULL>").astype(str)
+
+    dev_records = [tuple(row) for row in dev_norm.to_records(index=False)]
+    test_records = [tuple(row) for row in test_norm.to_records(index=False)]
+
+    dev_counter = Counter(dev_records)
+    test_counter = Counter(test_records)
+
+    only_dev_records = []
+    only_test_records = []
+
+    for rec, cnt in (dev_counter - test_counter).items():
+        only_dev_records.extend([rec] * cnt)
+
+    for rec, cnt in (test_counter - dev_counter).items():
+        only_test_records.extend([rec] * cnt)
+
+    return {
+        "common_cols": common_cols,
+        "only_dev": pd.DataFrame(only_dev_records, columns=common_cols),
+        "only_test": pd.DataFrame(only_test_records, columns=common_cols),
+    }
+
+
 def color_status(row):
     return [f"background-color: {row['color']}; color: white"] * len(row)
 
@@ -197,52 +232,248 @@ st.caption(
     "Iki connection string ile tablo/alan tipi farklarini ve istenirse veri farklarini gosterir."
 )
 
-with st.sidebar:
-    st.header("Baglanti")
-    dev_conn = st.text_input("Dev connection string", type="password")
-    test_conn = st.text_input("Test connection string", type="password")
-    connect = st.button("Baglan ve getir")
+for side in ("dev", "test"):
+    if f"{side}_tables" not in st.session_state:
+        st.session_state[f"{side}_tables"] = []
+    if f"{side}_schema" not in st.session_state:
+        st.session_state[f"{side}_schema"] = {}
+    if f"{side}_engine" not in st.session_state:
+        st.session_state[f"{side}_engine"] = None
+    if f"{side}_loaded_conn" not in st.session_state:
+        st.session_state[f"{side}_loaded_conn"] = ""
+    if f"{side}_error" not in st.session_state:
+        st.session_state[f"{side}_error"] = None
 
-if "connected" not in st.session_state:
-    st.session_state.connected = False
 
-if connect:
+def sync_from_dev():
+    selected = st.session_state.get("dev_selected_table")
+    if selected and selected in st.session_state.get("test_tables", []):
+        st.session_state.test_selected_table = selected
+
+
+def sync_from_test():
+    selected = st.session_state.get("test_selected_table")
+    if selected and selected in st.session_state.get("dev_tables", []):
+        st.session_state.dev_selected_table = selected
+
+
+def load_side(side: str, conn_str: str):
+    raw_conn = (conn_str or "").strip()
+    loaded_key = f"{side}_loaded_conn"
+
+    if not raw_conn:
+        st.session_state[f"{side}_tables"] = []
+        st.session_state[f"{side}_schema"] = {}
+        st.session_state[f"{side}_engine"] = None
+        st.session_state[f"{side}_error"] = None
+        st.session_state[loaded_key] = ""
+        return
+
+    if st.session_state.get(loaded_key) == raw_conn:
+        return
+
     try:
-        dev_tables, dev_schema, dev_engine = safe_read_schema(dev_conn)
-        test_tables, test_schema, test_engine = safe_read_schema(test_conn)
-        st.session_state.connected = True
-        st.session_state.dev_tables = dev_tables
-        st.session_state.test_tables = test_tables
-        st.session_state.dev_schema = dev_schema
-        st.session_state.test_schema = test_schema
-        st.session_state.dev_engine = dev_engine
-        st.session_state.test_engine = test_engine
-        st.success("Baglanti basarili.")
+        tables, schema, engine = safe_read_schema(raw_conn)
+        st.session_state[f"{side}_tables"] = tables
+        st.session_state[f"{side}_schema"] = schema
+        st.session_state[f"{side}_engine"] = engine
+        st.session_state[f"{side}_error"] = None
+        st.session_state[loaded_key] = raw_conn
     except SQLAlchemyError as exc:
-        st.session_state.connected = False
-        st.error(f"Baglanti hatasi: {exc}")
+        st.session_state[f"{side}_tables"] = []
+        st.session_state[f"{side}_schema"] = {}
+        st.session_state[f"{side}_engine"] = None
+        st.session_state[f"{side}_error"] = str(exc)
+        st.session_state[loaded_key] = raw_conn
 
-if st.session_state.connected:
+
+def extract_schemas(tables: list[str]) -> list[str]:
+    schemas = sorted({t.split(".", 1)[0] for t in tables if "." in t})
+    return schemas
+
+
+def filter_tables(
+    tables: list[str],
+    schema_filter: str | None,
+    text_filter: str | None,
+) -> list[str]:
+    result = tables
+    if schema_filter and schema_filter != "(tum schemalar)":
+        prefix = f"{schema_filter}."
+        result = [t for t in result if t.startswith(prefix)]
+    q = (text_filter or "").strip().lower()
+    if q:
+        result = [t for t in result if q in t.lower()]
+    return result
+
+
+conn_col1, conn_col2 = st.columns(2)
+with conn_col1:
+    st.markdown("### DEV Baglantisi")
+    dev_conn = st.text_area(
+        "DEV connection string",
+        key="dev_conn_input",
+        height=100,
+        placeholder="Data Source=...;Initial Catalog=...;Integrated Security=True;TrustServerCertificate=True;",
+    )
+    if not (dev_conn or "").strip():
+        st.markdown(
+            "<span style='color:#dc2626;font-weight:600;'>DEV connection string bos birakilamaz.</span>",
+            unsafe_allow_html=True,
+        )
+with conn_col2:
+    st.markdown("### TEST Baglantisi")
+    test_conn = st.text_area(
+        "TEST connection string",
+        key="test_conn_input",
+        height=100,
+        placeholder="Data Source=...;Initial Catalog=...;Integrated Security=True;TrustServerCertificate=True;",
+    )
+    if not (test_conn or "").strip():
+        st.markdown(
+            "<span style='color:#dc2626;font-weight:600;'>TEST connection string bos birakilamaz.</span>",
+            unsafe_allow_html=True,
+        )
+
+btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+with btn_col1:
+    fetch_dev = st.button("DEV tablolarini getir", use_container_width=True)
+with btn_col2:
+    fetch_test = st.button("TEST tablolarini getir", use_container_width=True)
+with btn_col3:
+    fetch_both = st.button("Ikisini de getir", use_container_width=True)
+
+if fetch_both:
+    fetch_dev = True
+    fetch_test = True
+
+if fetch_dev:
+    if not (dev_conn or "").strip():
+        st.error("DEV connection string bos. Once DEV baglantisini gir.")
+    else:
+        load_side("dev", dev_conn)
+
+if fetch_test:
+    if not (test_conn or "").strip():
+        st.error("TEST connection string bos. Once TEST baglantisini gir.")
+    else:
+        load_side("test", test_conn)
+
+if st.session_state.dev_error:
+    st.error(f"DEV baglanti hatasi: {st.session_state.dev_error}")
+if st.session_state.test_error:
+    st.error(f"TEST baglanti hatasi: {st.session_state.test_error}")
+
+list_col1, list_col2 = st.columns(2)
+
+with list_col1:
+    st.subheader("DEV - Sema/Tablo")
     dev_tables = st.session_state.dev_tables
+    if dev_tables:
+        dev_schemas = extract_schemas(dev_tables)
+        dev_schema_choice = st.selectbox(
+            "DEV schema filtresi",
+            options=["(tum schemalar)"] + dev_schemas,
+            key="dev_schema_choice",
+        )
+        dev_text_filter = st.text_input(
+            "DEV tablo ara (filtre)",
+            key="dev_text_filter",
+            placeholder="ornegin: order, invoice, dbo.",
+        )
+        dev_filtered_tables = filter_tables(dev_tables, dev_schema_choice, dev_text_filter)
+        if not dev_filtered_tables:
+            st.warning("Filtreye uyan DEV tablo bulunamadi.")
+        else:
+            if (
+                "dev_selected_table" not in st.session_state
+                or st.session_state.dev_selected_table not in dev_filtered_tables
+            ):
+                st.session_state.dev_selected_table = dev_filtered_tables[0]
+            st.selectbox(
+                "DEV tablo sec",
+                options=dev_filtered_tables,
+                key="dev_selected_table",
+                on_change=sync_from_dev,
+            )
+        st.caption(f"Toplam tablo: {len(dev_tables)}")
+    else:
+        st.info("DEV tarafinda listelenecek tablo yok. (Butonla getir)")
+
+with list_col2:
+    st.subheader("TEST - Sema/Tablo")
     test_tables = st.session_state.test_tables
+    if test_tables:
+        test_schemas = extract_schemas(test_tables)
+        test_schema_choice = st.selectbox(
+            "TEST schema filtresi",
+            options=["(tum schemalar)"] + test_schemas,
+            key="test_schema_choice",
+        )
+        test_text_filter = st.text_input(
+            "TEST tablo ara (filtre)",
+            key="test_text_filter",
+            placeholder="ornegin: order, invoice, dbo.",
+        )
+        test_filtered_tables = filter_tables(test_tables, test_schema_choice, test_text_filter)
+        if not test_filtered_tables:
+            st.warning("Filtreye uyan TEST tablo bulunamadi.")
+        else:
+            if (
+                "test_selected_table" not in st.session_state
+                or st.session_state.test_selected_table not in test_filtered_tables
+            ):
+                st.session_state.test_selected_table = test_filtered_tables[0]
+            st.selectbox(
+                "TEST tablo sec",
+                options=test_filtered_tables,
+                key="test_selected_table",
+                on_change=sync_from_test,
+            )
+        st.caption(f"Toplam tablo: {len(test_tables)}")
+    else:
+        st.info("TEST tarafinda listelenecek tablo yok. (Butonla getir)")
+
+if (
+    st.session_state.get("dev_selected_table")
+    and st.session_state.dev_selected_table in st.session_state.test_tables
+):
+    st.session_state.test_selected_table = st.session_state.dev_selected_table
+elif (
+    st.session_state.get("test_selected_table")
+    and st.session_state.test_selected_table in st.session_state.dev_tables
+):
+    st.session_state.dev_selected_table = st.session_state.test_selected_table
+
+selected_dev_table = st.session_state.get("dev_selected_table")
+selected_test_table = st.session_state.get("test_selected_table")
+
+compare_clicked = st.button("Tablolari karsilastir", type="primary")
+if compare_clicked:
+    st.session_state.last_compared = {
+        "dev_table": selected_dev_table,
+        "test_table": selected_test_table,
+    }
+
+last = st.session_state.get("last_compared") or {}
+dev_to_compare = last.get("dev_table")
+test_to_compare = last.get("test_table")
+
+if dev_to_compare and test_to_compare:
+    st.divider()
+    st.subheader("Alan ve Tip Karsilastirmasi")
+    st.caption(f"DEV: {dev_to_compare}  |  TEST: {test_to_compare}")
+
     dev_schema = st.session_state.dev_schema
     test_schema = st.session_state.test_schema
-
-    table_options = build_table_presence_options(dev_tables, test_tables)
-    selected_label = st.selectbox("Tablo sec", [item[0] for item in table_options])
-    selected_table = next(
-        table_name for label, table_name in table_options if label == selected_label
-    )
-
-    dev_cols = dev_schema.get(selected_table, {})
-    test_cols = test_schema.get(selected_table, {})
+    dev_cols = dev_schema.get(dev_to_compare, {})
+    test_cols = test_schema.get(test_to_compare, {})
     comp_df = compare_table_columns(dev_cols, test_cols)
 
     hide_same = st.checkbox("Ayni olan alanlari gizle", value=False)
     if hide_same:
         comp_df = comp_df[comp_df["status"] != "same"]
 
-    st.subheader("Alan ve Tip Karsilastirmasi")
     st.dataframe(
         comp_df.style.apply(color_status, axis=1),
         use_container_width=True,
@@ -250,30 +481,42 @@ if st.session_state.connected:
     )
 
     if not dev_cols:
-        st.warning("Bu tablo DEV tarafinda yok.")
+        st.warning("Secilen tablo DEV tarafinda bulunamadi.")
     if not test_cols:
-        st.warning("Bu tablo TEST tarafinda yok.")
+        st.warning("Secilen tablo TEST tarafinda bulunamadi.")
 
-    with st.expander("Veri karsilastirmasi (opsiyonel)", expanded=False):
-        enable_data_compare = st.checkbox("Verileri de karsilastir")
+    with st.expander("Veri farklari (opsiyonel)", expanded=False):
+        enable_data_compare = st.checkbox("Verileri de karsilastir", key="enable_data_compare")
         if enable_data_compare:
-            available_key_cols = sorted(set(dev_cols.keys()) & set(test_cols.keys()))
-            key_cols = st.multiselect(
-                "Anahtar kolon(lar) (satir eslestirme icin)", available_key_cols
+            compare_mode = st.radio(
+                "Karsilastirma modu",
+                options=[
+                    "Anahtar kolon ile satir eslestir",
+                    "Kolondan bagimsiz (ham satir farki)",
+                ],
             )
             limit = st.number_input("Maksimum satir (0 = tumu)", min_value=0, value=1000)
 
+            available_key_cols = sorted(set(dev_cols.keys()) & set(test_cols.keys()))
+            key_cols = []
+            if compare_mode == "Anahtar kolon ile satir eslestir":
+                key_cols = st.multiselect(
+                    "Anahtar kolon(lar) (satir eslestirme icin)", available_key_cols
+                )
+
             if st.button("Veri farklarini getir"):
-                if not key_cols:
-                    st.warning("Lutfen en az bir anahtar kolon secin.")
-                else:
-                    try:
-                        dev_df = read_table_data(
-                            st.session_state.dev_engine, selected_table, int(limit)
-                        )
-                        test_df = read_table_data(
-                            st.session_state.test_engine, selected_table, int(limit)
-                        )
+                try:
+                    dev_df = read_table_data(
+                        st.session_state.dev_engine, dev_to_compare, int(limit)
+                    )
+                    test_df = read_table_data(
+                        st.session_state.test_engine, test_to_compare, int(limit)
+                    )
+
+                    if compare_mode == "Anahtar kolon ile satir eslestir":
+                        if not key_cols:
+                            st.warning("Lutfen en az bir anahtar kolon secin.")
+                            st.stop()
                         result = compare_dataframes(dev_df, test_df, key_cols)
 
                         st.markdown("#### Sadece Dev'de olan satirlar")
@@ -295,9 +538,28 @@ if st.session_state.connected:
                             for item in result["changed"][:200]:
                                 st.write(f"Anahtar: {item['key']}")
                                 st.json(item["diffs"])
-                    except SQLAlchemyError as exc:
-                        st.error(f"Veri okuma/karsilastirma hatasi: {exc}")
-                    except Exception as exc:  # pragma: no cover
-                        st.error(f"Beklenmeyen hata: {exc}")
+                    else:
+                        keyless = compare_dataframes_keyless(dev_df, test_df)
+                        if not keyless["common_cols"]:
+                            st.warning("Ortak kolon yok, ham satir karsilastirmasi yapilamadi.")
+                        else:
+                            st.caption(
+                                "Ham satir karsilastirmasi ortak kolonlar uzerinden yapildi."
+                            )
+                            st.markdown("#### Sadece Dev'de olan satirlar")
+                            if keyless["only_dev"].empty:
+                                st.info("Yok")
+                            else:
+                                st.dataframe(keyless["only_dev"], use_container_width=True)
+
+                            st.markdown("#### Sadece Test'te olan satirlar")
+                            if keyless["only_test"].empty:
+                                st.info("Yok")
+                            else:
+                                st.dataframe(keyless["only_test"], use_container_width=True)
+                except SQLAlchemyError as exc:
+                    st.error(f"Veri okuma/karsilastirma hatasi: {exc}")
+                except Exception as exc:  # pragma: no cover
+                    st.error(f"Beklenmeyen hata: {exc}")
 else:
-    st.info("Dev ve Test connection string girip 'Baglan ve getir' butonuna basin.")
+    st.info("Karsilastirma icin en az bir tabloda secim yapin.")
