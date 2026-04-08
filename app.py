@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,6 +25,12 @@ from db_diff.ui import STATUS_LABELS, inject_style, render_status_legend, style_
 st.set_page_config(page_title="Database Diff Studio", page_icon=":material/compare:", layout="wide")
 init_state()
 inject_style()
+if "is_connecting" not in st.session_state:
+    st.session_state.is_connecting = False
+if "last_connected_dev_conn" not in st.session_state:
+    st.session_state.last_connected_dev_conn = ""
+if "last_connected_test_conn" not in st.session_state:
+    st.session_state.last_connected_test_conn = ""
 
 
 @st.cache_resource(show_spinner=False)
@@ -35,8 +43,8 @@ def get_schema_snapshot(conn_str: str):
     return read_schema_bundle(get_engine(conn_str))
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def get_table_snapshot(conn_str: str, table_name: str, limit: int):
+    # Do not cache row-level table data.
     return read_table_data(get_engine(conn_str), table_name, limit)
 
 
@@ -61,6 +69,65 @@ def build_sql_blob(sql_lines: list[str]) -> str:
     return "\n".join(sql_lines)
 
 
+def format_seconds(value: float) -> str:
+    secs = max(0, int(round(value)))
+    minutes, seconds = divmod(secs, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def suggest_key_columns(
+    dev_table_def: dict | None, test_table_def: dict | None, common_cols: list[str]
+) -> list[str]:
+    common_set = set(common_cols)
+    candidates: list[list[str]] = []
+
+    if dev_table_def:
+        dev_pk = [c for c in (dev_table_def.get("pk_columns") or []) if c in common_set]
+        if dev_pk:
+            candidates.append(dev_pk)
+        for idx in dev_table_def.get("indexes", []):
+            if idx.get("unique"):
+                cols = [c for c in (idx.get("column_names") or []) if c in common_set]
+                if cols:
+                    candidates.append(cols)
+
+    if test_table_def:
+        test_pk = [c for c in (test_table_def.get("pk_columns") or []) if c in common_set]
+        if test_pk:
+            candidates.append(test_pk)
+        for idx in test_table_def.get("indexes", []):
+            if idx.get("unique"):
+                cols = [c for c in (idx.get("column_names") or []) if c in common_set]
+                if cols:
+                    candidates.append(cols)
+
+    return candidates[0] if candidates else []
+
+
+def render_quick_table_selector(
+    title: str, tables: list[str], table_key: str, expanded: bool = False
+) -> None:
+    with st.expander(title, expanded=expanded):
+        if tables:
+            event = st.dataframe(
+                pd.DataFrame({"table": tables}),
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key=table_key,
+            )
+            selected_rows = event.selection.get("rows", []) if event and event.selection else []
+            if selected_rows:
+                picked_table = tables[selected_rows[0]]
+                if st.session_state.selected_table != picked_table:
+                    st.session_state.selected_table = picked_table
+                    st.rerun()
+            st.caption("Tip: Click a row to set active table.")
+        else:
+            st.caption("No tables in this list.")
+
+
 st.title("Database Diff Studio")
 st.caption("Compare DEV and TEST schemas/data and generate sync-ready SQL scripts.")
 
@@ -68,6 +135,25 @@ with st.sidebar:
     st.subheader("Workflow")
     st.caption("1) Connect -> 2) Compare -> 3) Generate SQL")
     st.checkbox("Show only differences", key="show_only_differences")
+    if st.button("Clear cache", use_container_width=True):
+        get_schema_snapshot.clear()
+        get_engine.clear()
+        st.session_state.connected = False
+        st.session_state.dev_tables = []
+        st.session_state.test_tables = []
+        st.session_state.dev_schema = {}
+        st.session_state.test_schema = {}
+        st.session_state.dev_table_defs = {}
+        st.session_state.test_table_defs = {}
+        st.session_state.dev_sequences = {}
+        st.session_state.test_sequences = {}
+        st.session_state.data_diff_result = None
+        st.session_state.generated_sql = ""
+        st.session_state.generated_sequence_sql = ""
+        st.session_state.last_connected_dev_conn = ""
+        st.session_state.last_connected_test_conn = ""
+        st.success("Cache cleared.")
+        st.rerun()
     st.divider()
     st.subheader("About this tool")
     st.markdown(
@@ -85,7 +171,12 @@ with st.sidebar:
         """
     )
 
-tab_connect, tab_compare, tab_sql = st.tabs(["Connect", "Compare", "DDL & Sync Script"])
+if "generated_sequence_sql" not in st.session_state:
+    st.session_state.generated_sequence_sql = ""
+
+tab_connect, tab_compare, tab_sql, tab_sequence = st.tabs(
+    ["Connect", "Compare", "DDL & Sync Script", "Sequences"]
+)
 
 with tab_connect:
     st.markdown("### Step 1 - Connect to environments")
@@ -107,20 +198,43 @@ with tab_connect:
             help="SQLAlchemy URL or ADO.NET style string.",
         )
 
-    connect_clicked = st.button("Connect and load schemas", type="primary")
+    connect_clicked = st.button(
+        "Connect and load schemas",
+        type="primary",
+        disabled=st.session_state.is_connecting,
+    )
     if connect_clicked:
         if not dev_conn or not test_conn:
             st.error("Both DEV and TEST connection strings are required.")
+        elif (
+            st.session_state.connected
+            and st.session_state.last_connected_dev_conn == dev_conn
+            and st.session_state.last_connected_test_conn == test_conn
+        ):
+            st.info("Already connected with same connection strings. Using cached metadata.")
         else:
+            st.session_state.is_connecting = True
             bar = st.progress(0, text="Starting connection checks...")
+            status_box = st.empty()
             try:
-                with st.spinner("Connecting DEV..."):
-                    bar.progress(20, text="Connecting DEV")
-                    dev_bundle = get_schema_snapshot(dev_conn)
-                with st.spinner("Connecting TEST..."):
-                    bar.progress(60, text="Connecting TEST")
-                    test_bundle = get_schema_snapshot(test_conn)
+                started_at = time.perf_counter()
+                bar.progress(20, text="Connecting DEV")
+                status_box.info("Step 1/2: Connecting DEV...")
+                dev_started = time.perf_counter()
+                dev_bundle = get_schema_snapshot(dev_conn)
+                dev_elapsed = time.perf_counter() - dev_started
+                total_elapsed = time.perf_counter() - started_at
+
+                bar.progress(60, text="Connecting TEST")
+                status_box.info(
+                    "Step 2/2: Connecting TEST...\n\n"
+                    f"Elapsed: {format_seconds(total_elapsed)} | "
+                    f"Estimated remaining: {format_seconds(dev_elapsed)}"
+                )
+                test_bundle = get_schema_snapshot(test_conn)
+                final_elapsed = time.perf_counter() - started_at
                 bar.progress(100, text="Connection complete")
+                status_box.success(f"Connected successfully in {format_seconds(final_elapsed)}.")
 
                 st.session_state.connected = True
                 st.session_state.dev_tables = dev_bundle["tables"]
@@ -131,13 +245,19 @@ with tab_connect:
                 st.session_state.test_table_defs = test_bundle["table_defs"]
                 st.session_state.dev_sequences = dev_bundle["sequences"]
                 st.session_state.test_sequences = test_bundle["sequences"]
+                st.session_state.last_connected_dev_conn = dev_conn
+                st.session_state.last_connected_test_conn = test_conn
                 st.success("Connections successful. Move to Compare step.")
             except SQLAlchemyError as exc:
                 st.session_state.connected = False
+                status_box.empty()
                 st.error(f"Database error while connecting: {exc}")
             except Exception as exc:  # pragma: no cover
                 st.session_state.connected = False
+                status_box.empty()
                 st.error(f"Unexpected connection error: {exc}")
+            finally:
+                st.session_state.is_connecting = False
 
 with tab_compare:
     st.markdown("### Step 2 - Compare schema and data")
@@ -171,25 +291,19 @@ with tab_compare:
 
         lcol, rcol = st.columns(2)
         with lcol:
-            with st.expander(f"Missing in TEST tables ({len(missing_in_test_tables)})", expanded=True):
-                if missing_in_test_tables:
-                    st.dataframe(
-                        pd.DataFrame({"table": missing_in_test_tables}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No missing tables in TEST.")
+            render_quick_table_selector(
+                f"Missing in TEST tables ({len(missing_in_test_tables)})",
+                missing_in_test_tables,
+                "missing_test_table_click",
+                expanded=True,
+            )
         with rcol:
-            with st.expander(f"Missing in DEV tables ({len(missing_in_dev_tables)})", expanded=True):
-                if missing_in_dev_tables:
-                    st.dataframe(
-                        pd.DataFrame({"table": missing_in_dev_tables}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No missing tables in DEV.")
+            render_quick_table_selector(
+                f"Missing in DEV tables ({len(missing_in_dev_tables)})",
+                missing_in_dev_tables,
+                "missing_dev_table_click",
+                expanded=True,
+            )
 
         column_diff_tables: list[str] = []
         type_diff_tables: list[str] = []
@@ -210,63 +324,19 @@ with tab_compare:
 
         dcol, tcol = st.columns(2)
         with dcol:
-            with st.expander(
+            render_quick_table_selector(
                 f"Tables with missing/different columns ({len(column_diff_tables)})",
+                column_diff_tables,
+                "column_diff_table_click",
                 expanded=False,
-            ):
-                if column_diff_tables:
-                    st.dataframe(
-                        pd.DataFrame({"table": column_diff_tables}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No tables with missing columns.")
+            )
         with tcol:
-            with st.expander(
+            render_quick_table_selector(
                 f"Tables with column type differences ({len(type_diff_tables)})",
+                type_diff_tables,
+                "type_diff_table_click",
                 expanded=False,
-            ):
-                if type_diff_tables:
-                    st.dataframe(
-                        pd.DataFrame({"table": type_diff_tables}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No tables with type differences.")
-
-        dev_sequences = st.session_state.get("dev_sequences", {})
-        test_sequences = st.session_state.get("test_sequences", {})
-        missing_sequences_in_test = sorted(set(dev_sequences) - set(test_sequences))
-        missing_sequences_in_dev = sorted(set(test_sequences) - set(dev_sequences))
-        sq1, sq2 = st.columns(2)
-        with sq1:
-            with st.expander(
-                f"Sequences missing in TEST ({len(missing_sequences_in_test)})",
-                expanded=False,
-            ):
-                if missing_sequences_in_test:
-                    st.dataframe(
-                        pd.DataFrame({"sequence": missing_sequences_in_test}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No missing sequences in TEST.")
-        with sq2:
-            with st.expander(
-                f"Sequences missing in DEV ({len(missing_sequences_in_dev)})",
-                expanded=False,
-            ):
-                if missing_sequences_in_dev:
-                    st.dataframe(
-                        pd.DataFrame({"sequence": missing_sequences_in_dev}),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                else:
-                    st.caption("No missing sequences in DEV.")
+            )
 
         table_options = table_df["table"].tolist()
         if not table_options:
@@ -309,6 +379,25 @@ with tab_compare:
             st.toggle("Enable data comparison", key="data_compare_enabled")
             if st.session_state.data_compare_enabled and dev_cols and test_cols:
                 common_cols = sorted(set(dev_cols) & set(test_cols))
+                dev_table_def = st.session_state.get("dev_table_defs", {}).get(selected_table)
+                test_table_def = st.session_state.get("test_table_defs", {}).get(selected_table)
+                auto_keys = suggest_key_columns(dev_table_def, test_table_def, common_cols)
+
+                if "key_selection_table" not in st.session_state:
+                    st.session_state.key_selection_table = ""
+                if (
+                    st.session_state.key_selection_table != selected_table
+                    or not st.session_state.selected_keys
+                ):
+                    st.session_state.selected_keys = auto_keys
+                    st.session_state.key_selection_table = selected_table
+
+                if auto_keys:
+                    st.caption(
+                        f"Auto key suggestion from PK/UNIQUE index: {', '.join(auto_keys)}"
+                    )
+                else:
+                    st.caption("No PK/UNIQUE index detected for automatic key suggestion.")
                 st.multiselect(
                     "Key columns (for row matching)",
                     common_cols,
@@ -355,9 +444,31 @@ with tab_compare:
                         st.dataframe(result["only_test"], use_container_width=True)
                     with st.expander("Changed rows", expanded=True):
                         if result["changed"]:
-                            for item in result["changed"][:200]:
-                                st.write(f"Key: {item['key']}")
-                                st.json(item["diffs"])
+                            changed_rows_flat: list[dict[str, str]] = []
+                            key_cols = st.session_state.selected_keys
+                            for item in result["changed"]:
+                                key_value = item["key"]
+                                if not isinstance(key_value, tuple):
+                                    key_value = (key_value,)
+                                key_map = dict(zip(key_cols, key_value))
+                                for col_name, diff_values in item["diffs"].items():
+                                    row = {
+                                        "changed_column": col_name,
+                                        "dev_value": str(diff_values.get("dev")),
+                                        "test_value": str(diff_values.get("test")),
+                                    }
+                                    for k in key_cols:
+                                        row[k] = str(key_map.get(k))
+                                    changed_rows_flat.append(row)
+
+                            changed_df = pd.DataFrame(changed_rows_flat)
+                            key_first_columns = key_cols + [
+                                "changed_column",
+                                "dev_value",
+                                "test_value",
+                            ]
+                            changed_df = changed_df[key_first_columns]
+                            st.dataframe(changed_df, use_container_width=True, hide_index=True)
                         else:
                             st.info("No changed rows.")
 
@@ -382,14 +493,7 @@ with tab_sql:
         s4.metric("Rows to INSERT", summary["rows_insert"])
         s5.metric("Rows to UPDATE", summary["rows_update"])
         s6.metric("Rows to DELETE", summary["rows_delete"])
-        dev_sequences = st.session_state.get("dev_sequences", {})
-        test_sequences = st.session_state.get("test_sequences", {})
-        s7, s8 = st.columns(2)
-        s7.metric("Sequences missing in TEST", len(set(dev_sequences) - set(test_sequences)))
-        s8.metric("Sequences missing in DEV", len(set(test_sequences) - set(dev_sequences)))
-
         include_schema = st.checkbox("Include schema sync SQL (CREATE/ALTER)", value=True)
-        include_sequences = st.checkbox("Include sequence sync SQL (CREATE/DROP)", value=True)
         include_data = st.checkbox("Include data sync SQL (INSERT/UPDATE/DELETE)", value=False)
         generate_clicked = st.button("Generate SQL script", type="primary")
 
@@ -401,8 +505,6 @@ with tab_sql:
                         selected_table, dev_cols, test_cols, dev_table_def=dev_table_def
                     )
                 )
-            if include_sequences:
-                sql_lines.extend(generate_sequence_sync_sql(dev_sequences, test_sequences))
             if include_data and st.session_state.data_diff_result and st.session_state.selected_keys:
                 sql_lines.extend(
                     generate_data_sync_sql(
@@ -436,3 +538,64 @@ with tab_sql:
                 )
                 st.session_state.generated_sql = build_sql_blob(sync_sql)
                 st.rerun()
+
+with tab_sequence:
+    st.markdown("### Step 4 - Compare and generate sequence SQL")
+    if not st.session_state.connected:
+        st.info("Open Connect step and load both schemas first.")
+    else:
+        dev_sequences = st.session_state.get("dev_sequences", {})
+        test_sequences = st.session_state.get("test_sequences", {})
+        missing_sequences_in_test = sorted(set(dev_sequences) - set(test_sequences))
+        missing_sequences_in_dev = sorted(set(test_sequences) - set(dev_sequences))
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total DEV sequences", len(dev_sequences))
+        m2.metric("Missing in TEST", len(missing_sequences_in_test))
+        m3.metric("Missing in DEV", len(missing_sequences_in_dev))
+
+        sq1, sq2 = st.columns(2)
+        with sq1:
+            with st.expander(
+                f"Sequences missing in TEST ({len(missing_sequences_in_test)})",
+                expanded=True,
+            ):
+                if missing_sequences_in_test:
+                    st.dataframe(
+                        pd.DataFrame({"sequence": missing_sequences_in_test}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No missing sequences in TEST.")
+        with sq2:
+            with st.expander(
+                f"Sequences missing in DEV ({len(missing_sequences_in_dev)})",
+                expanded=True,
+            ):
+                if missing_sequences_in_dev:
+                    st.dataframe(
+                        pd.DataFrame({"sequence": missing_sequences_in_dev}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No missing sequences in DEV.")
+
+        if st.button("Generate sequence SQL", type="primary"):
+            seq_sql_lines = generate_sequence_sync_sql(dev_sequences, test_sequences)
+            st.session_state.generated_sequence_sql = build_sql_blob(seq_sql_lines)
+
+        st.markdown("#### Generated sequence SQL")
+        st.code(
+            st.session_state.generated_sequence_sql
+            or "-- Click 'Generate sequence SQL' to create output.",
+            language="sql",
+        )
+        st.download_button(
+            "Download sequence SQL",
+            data=st.session_state.generated_sequence_sql or "-- empty",
+            file_name="sync_sequences_dev_to_test.sql",
+            mime="text/sql",
+            use_container_width=True,
+        )
