@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
+from urllib.parse import quote_plus
 
 
 st.set_page_config(page_title="DB Diff Tool", layout="wide")
@@ -14,18 +15,70 @@ COLOR_TYPE_DIFF = "#f59e0b"  # amber
 
 
 def safe_read_schema(conn_str: str):
-    engine = create_engine(conn_str)
+    engine = create_engine(normalize_connection_string(conn_str))
     inspector = inspect(engine)
-    tables = inspector.get_table_names()
+    tables = []
     schema = {}
 
-    for table in tables:
-        cols = inspector.get_columns(table)
-        schema[table] = {
-            col["name"]: str(col.get("type", "UNKNOWN")).upper() for col in cols
-        }
+    for schema_name in inspector.get_schema_names():
+        if schema_name in ("INFORMATION_SCHEMA", "sys"):
+            continue
+        for table in inspector.get_table_names(schema=schema_name):
+            full_table_name = f"{schema_name}.{table}"
+            tables.append(full_table_name)
+            cols = inspector.get_columns(table, schema=schema_name)
+            schema[full_table_name] = {
+                col["name"]: str(col.get("type", "UNKNOWN")).upper() for col in cols
+            }
 
     return tables, schema, engine
+
+
+def normalize_connection_string(conn_str: str) -> str:
+    raw = (conn_str or "").strip()
+    if not raw:
+        return raw
+
+    # If user already provides a SQLAlchemy URL, keep it as-is.
+    if "://" in raw:
+        return raw
+
+    # Support ADO.NET style SQL Server strings like:
+    # Data Source=...;Initial Catalog=...;Integrated Security=True;TrustServerCertificate=True;
+    parts = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        parts[key.strip().lower()] = value.strip()
+
+    server = parts.get("data source") or parts.get("server")
+    database = parts.get("initial catalog") or parts.get("database")
+    if not server or not database:
+        return raw
+
+    integrated_security = (parts.get("integrated security") or "").lower() in (
+        "true",
+        "yes",
+        "sspi",
+    )
+
+    params = [f"DRIVER={{{parts.get('driver', 'ODBC Driver 17 for SQL Server')}}}"]
+    if integrated_security:
+        params.append("Trusted_Connection=yes")
+    else:
+        user = parts.get("user id") or parts.get("uid")
+        password = parts.get("password") or parts.get("pwd")
+        if user and password:
+            params.append(f"UID={user}")
+            params.append(f"PWD={password}")
+
+    if (parts.get("trustservercertificate") or "").lower() in ("true", "yes"):
+        params.append("TrustServerCertificate=yes")
+
+    odbc_str = f"SERVER={server};DATABASE={database};" + ";".join(params) + ";"
+    return f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc_str)}"
 
 
 def compare_table_columns(dev_cols: dict, test_cols: dict) -> pd.DataFrame:
@@ -62,8 +115,18 @@ def compare_table_columns(dev_cols: dict, test_cols: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def quote_ident(name: str) -> str:
+    return f"[{name.replace(']', ']]')}]"
+
+
 def read_table_data(engine, table_name: str, limit: int) -> pd.DataFrame:
-    query = text(f"SELECT * FROM {table_name}")
+    if "." in table_name:
+        schema_name, simple_table_name = table_name.split(".", 1)
+        qualified_table = f"{quote_ident(schema_name)}.{quote_ident(simple_table_name)}"
+    else:
+        qualified_table = quote_ident(table_name)
+
+    query = text(f"SELECT * FROM {qualified_table}")
     with engine.connect() as conn:
         df = pd.read_sql(query, conn)
     if limit > 0:
@@ -113,6 +176,22 @@ def color_status(row):
     return [f"background-color: {row['color']}; color: white"] * len(row)
 
 
+def build_table_presence_options(dev_tables: list[str], test_tables: list[str]):
+    all_tables = sorted(set(dev_tables) | set(test_tables))
+    options = []
+    for table_name in all_tables:
+        in_dev = table_name in dev_tables
+        in_test = table_name in test_tables
+        if in_dev and in_test:
+            label = f"{table_name} (iki tarafta)"
+        elif in_dev:
+            label = f"{table_name} (sadece DEV)"
+        else:
+            label = f"{table_name} (sadece TEST)"
+        options.append((label, table_name))
+    return options
+
+
 st.title("DB Diff Tool (Dev vs Test)")
 st.caption(
     "Iki connection string ile tablo/alan tipi farklarini ve istenirse veri farklarini gosterir."
@@ -149,8 +228,11 @@ if st.session_state.connected:
     dev_schema = st.session_state.dev_schema
     test_schema = st.session_state.test_schema
 
-    all_tables = sorted(set(dev_tables) | set(test_tables))
-    selected_table = st.selectbox("Tablo sec", all_tables)
+    table_options = build_table_presence_options(dev_tables, test_tables)
+    selected_label = st.selectbox("Tablo sec", [item[0] for item in table_options])
+    selected_table = next(
+        table_name for label, table_name in table_options if label == selected_label
+    )
 
     dev_cols = dev_schema.get(selected_table, {})
     test_cols = test_schema.get(selected_table, {})
@@ -166,6 +248,11 @@ if st.session_state.connected:
         use_container_width=True,
         hide_index=True,
     )
+
+    if not dev_cols:
+        st.warning("Bu tablo DEV tarafinda yok.")
+    if not test_cols:
+        st.warning("Bu tablo TEST tarafinda yok.")
 
     with st.expander("Veri karsilastirmasi (opsiyonel)", expanded=False):
         enable_data_compare = st.checkbox("Verileri de karsilastir")

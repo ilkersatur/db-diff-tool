@@ -42,7 +42,8 @@ streamlit run app.py
 
 ## Notlar
 
-- Connection string, SQLAlchemy formatinda olmalidir.
+- Connection string SQLAlchemy URL olabilir veya su ADO.NET formatinda da yazilabilir:
+  `Data Source=IP_OR_HOST;Initial Catalog=DB_NAME;Integrated Security=True;TrustServerCertificate=True;`
 - Veri karsilastirmasinda anahtar kolon secimi zorunludur.
 - Cok buyuk tablolarda performans icin satir limiti kullanin.
 - Eger `Activate.ps1` calismazsa bir kere su komutu verin:
